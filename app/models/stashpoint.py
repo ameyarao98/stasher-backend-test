@@ -41,7 +41,7 @@ class Stashpoint(db.Model):
         super(Stashpoint, self).__init__(**kwargs)
         # Set the location from latitude and longitude
         if "latitude" in kwargs and "longitude" in kwargs:
-            point_wkt = f'POINT({kwargs["longitude"]} {kwargs["latitude"]})'
+            point_wkt = f"POINT({kwargs['longitude']} {kwargs['latitude']})"
             self.location = point_wkt
 
     def to_dict(self):
