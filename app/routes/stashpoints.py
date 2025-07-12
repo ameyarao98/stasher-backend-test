@@ -3,7 +3,7 @@
 from flask import Blueprint, jsonify, request
 from app.models import Stashpoint, Booking
 from datetime import datetime
-from sqlalchemy import func, select, outerjoin, and_
+from sqlalchemy import func, select, and_
 from app import db
 
 
@@ -12,6 +12,7 @@ bp = Blueprint("stashpoints", __name__)
 
 @bp.route("/", methods=["GET"])
 def get_stashpoints():
+    # Handle query parameters
     lat = request.args.get("lat", type=float)
     if lat is None:
         return "Invalid lat", 400
@@ -49,6 +50,7 @@ def get_stashpoints():
     if bag_count is None:
         return "Invalid bag_count", 400
 
+    # Add query to calculate distances
     distance_label = (
         func.ST_DistanceSphere(
             func.ST_MakePoint(lng, lat),
@@ -57,37 +59,59 @@ def get_stashpoints():
         / 1000
     ).label("distance_km")
 
-    available_capacity_label = func.greatest(
-        func.coalesce(
-            Stashpoint.capacity - func.coalesce(func.sum(Booking.bag_count), 0), 0
-        ),
-        0,
-    ).label("available_capacity")
-
-    query = (
-        select(Stashpoint, distance_label, available_capacity_label)
-        .select_from(
-            outerjoin(
-                Stashpoint,
-                Booking,
-                and_(
-                    Stashpoint.id == Booking.stashpoint_id,
-                    Booking.is_cancelled == False,
-                    Booking.dropoff_time < pickup_datetime,
-                    Booking.pickup_time > dropoff_datetime,
-                ),
-            ),
+    # Big subquery to handle calculating bag counts for overlapping bookings
+    dropoff_times = (
+        select(Booking.dropoff_time)
+        .where(
+            and_(
+                Booking.is_cancelled == False,
+                Booking.dropoff_time < pickup_datetime,
+                Booking.pickup_time > dropoff_datetime,
+            )
         )
-        .group_by(Stashpoint.id, distance_label, Stashpoint.capacity)
+        .distinct()
+        .subquery()
     )
 
+    concurrent_counts = (
+        select(
+            dropoff_times.c.dropoff_time,
+            func.sum(Booking.bag_count).label("concurrent_bags"),
+        )
+        .select_from(
+            dropoff_times.join(
+                Booking,
+                and_(
+                    Booking.is_cancelled == False,
+                    Booking.dropoff_time <= dropoff_times.c.dropoff_time,
+                    Booking.pickup_time > dropoff_times.c.dropoff_time,
+                ),
+            )
+        )
+        .group_by(dropoff_times.c.dropoff_time)
+        .subquery()
+    )
+
+    max_concurrent = select(
+        func.max(concurrent_counts.c.concurrent_bags)
+    ).scalar_subquery()
+
+    available_capacity_label = Stashpoint.capacity - func.coalesce(
+        max_concurrent, 0
+    ).label("available_capacity")
+
+    query = select(Stashpoint, distance_label, available_capacity_label).group_by(
+        Stashpoint.id, distance_label, Stashpoint.capacity
+    )
+    # Ensure that the stashpoint is open during the requested times
     query = query.filter(
         (Stashpoint.open_from <= dropoff_time) & (Stashpoint.open_until >= pickup_time)
     )
-
+    # If radius is specfied, filter by it
     if radius_km is not None:
         query = query.having(distance_label <= radius_km)
 
+    # Only show stashpoints with enough capacity
     query = query.having(bag_count <= available_capacity_label)
 
     query = query.order_by("distance_km")
